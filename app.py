@@ -73,9 +73,10 @@ def download_and_load_model():
 # 3. ANALYSIS LOGIC
 # =============================================================================
 
-def process_image(image_file, model, px_per_mm, thickness_mm):
+def process_image(image_file, model, px_per_mm, thickness_mm, method):
     """
     Executes the full image analysis pipeline (Tang et al., 2012 logic).
+    Handles both AI Detection and Manual Blue Fill methods with mode-specific cleaning.
     """
     # Convert uploaded file to numpy array
     file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
@@ -88,47 +89,89 @@ def process_image(image_file, model, px_per_mm, thickness_mm):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     gray_enhanced = clahe.apply(gray)
-    img_input = cv2.cvtColor(gray_enhanced, cv2.COLOR_GRAY2BGR)
-
-    # ---------------------------------------------------------
-    # B. Crack Detection (YOLO + Thresholding)
-    # ---------------------------------------------------------
-    # 1. YOLO Prediction
-    results = model.predict(img_input, conf=0.05, save=False, verbose=False)
     
-    if results[0].masks is None:
-        structure_map = np.zeros(gray.shape, dtype=np.uint8)
-    else:
-        masks = results[0].masks.data.cpu().numpy()
-        structure_map = np.zeros(gray.shape, dtype=np.uint8)
-        for m in masks:
-            m_resized = cv2.resize(m, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST)
-            structure_map = np.maximum(structure_map, m_resized)
-
-    # 2. Adaptive Thresholding
-    # Smoothing block size optimized for clay textures
-    connectivity_map = cv2.adaptiveThreshold(
-        gray_enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY_INV, 85, 15
-    )
-    connectivity_clean = remove_small_objects(connectivity_map.astype(bool), min_size=250).astype(np.uint8)
+    # Initialize the binary map (combined_map)
+    combined_map = None
+    min_clean_size = 200 # Default for AI mode
 
     # ---------------------------------------------------------
-    # C. Fusion & Cleaning
+    # B. Detection Strategy (AI vs Manual)
     # ---------------------------------------------------------
-    combined_map = cv2.bitwise_or(structure_map.astype(np.uint8), connectivity_clean)
     
-    kernel_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed_map = cv2.morphologyEx(combined_map, cv2.MORPH_CLOSE, kernel_bridge, iterations=2)
-    clean_map = remove_small_objects(closed_map.astype(bool), min_size=200).astype(np.uint8)
-    clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=200).astype(np.uint8)
+    if method == "AI Detection (YOLO)":
+        # 1. YOLO Prediction
+        img_input = cv2.cvtColor(gray_enhanced, cv2.COLOR_GRAY2BGR)
+        results = model.predict(img_input, conf=0.05, save=False, verbose=False)
+        
+        if results[0].masks is None:
+            structure_map = np.zeros(gray.shape, dtype=np.uint8)
+        else:
+            masks = results[0].masks.data.cpu().numpy()
+            structure_map = np.zeros(gray.shape, dtype=np.uint8)
+            for m in masks:
+                m_resized = cv2.resize(m, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST)
+                structure_map = np.maximum(structure_map, m_resized)
+
+        # 2. Adaptive Thresholding
+        connectivity_map = cv2.adaptiveThreshold(
+            gray_enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY_INV, 85, 15
+        )
+        # High noise filter for AI mode to remove soil texture noise
+        connectivity_clean = remove_small_objects(connectivity_map.astype(bool), min_size=250).astype(np.uint8)
+
+        # Fusion
+        combined_map = cv2.bitwise_or(structure_map.astype(np.uint8), connectivity_clean)
+        
+        # Set cleaning threshold high for AI to avoid noise
+        min_clean_size = 200
+
+    else: # method == "Manual Blue Fill"
+        # Convert BGR to HSV for more robust "Approximate Blue" detection
+        hsv_img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        
+        # Define range for Blue in HSV
+        # Hue (H): Blue is approx 120. We allow 90 to 150 (covers cyan-blue to purple-blue)
+        # Saturation (S): Must be reasonably high (>50) to ignore grey/white
+        # Value (V): Must be reasonably high (>50) to ignore black
+        lower_blue = np.array([90, 50, 50])
+        upper_blue = np.array([150, 255, 255])
+        
+        # Create mask based on HSV range
+        mask = cv2.inRange(hsv_img, lower_blue, upper_blue)
+        combined_map = mask
+        
+        # Set cleaning threshold VERY LOW for manual mode 
+        # (We trust your manual paint, so we keep even small dots/lines)
+        min_clean_size = 10
+
+    # ---------------------------------------------------------
+    # C. Cleaning & Refinement
+    # ---------------------------------------------------------
+    # Ensure binary format (0 or 255)
+    _, combined_map = cv2.threshold(combined_map, 127, 255, cv2.THRESH_BINARY)
+    
+    # Use smaller kernel for manual mode to preserve fine details
+    kernel_size = (3, 3) if method == "Manual Blue Fill" else (5, 5)
+    kernel_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
+    
+    closed_map = cv2.morphologyEx(combined_map, cv2.MORPH_CLOSE, kernel_bridge, iterations=1)
+    
+    # DYNAMIC CLEANING: Uses 200 for AI (removes noise) but 10 for Manual (keeps small cracks)
+    clean_map = remove_small_objects(closed_map.astype(bool), min_size=min_clean_size).astype(np.uint8)
+    
+    # Remove small holes inside the cracks
+    clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=min_clean_size).astype(np.uint8)
 
     # ---------------------------------------------------------
     # D. Skeletonization
     # ---------------------------------------------------------
     skeleton_base = skeletonize(clean_map)
     # Dilate to ensure connectivity before final skeletonization
-    kernel_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    # Use smaller dilation for manual mode to prevent merging close cracks
+    dilation_kernel = (3, 3) if method == "Manual Blue Fill" else (11, 11)
+    kernel_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, dilation_kernel)
+    
     final_binary_map = cv2.dilate(skeleton_base.astype(np.uint8), kernel_thick, iterations=1)
     final_skeleton = skeletonize(final_binary_map)
 
@@ -162,7 +205,11 @@ def process_image(image_file, model, px_per_mm, thickness_mm):
     # 4. Segment Analysis (N_seg, L_av, D_c)
     skel_segments = skel_int.copy()
     skel_segments[raw_nodes] = 0 
-    valid_segments = remove_small_objects(skel_segments.astype(bool), min_size=8)
+    
+    # Allow smaller segments in manual mode
+    min_seg_size = 5 if method == "Manual Blue Fill" else 8
+    valid_segments = remove_small_objects(skel_segments.astype(bool), min_size=min_seg_size)
+    
     num_segments, _ = cv2.connectedComponents(valid_segments.astype(np.uint8))
     num_segments -= 1
     
@@ -224,20 +271,31 @@ def main():
     with st.sidebar:
         st.header("1. Configuration")
         
-        # Load Model Automatically
-        model = download_and_load_model()
-        if model:
-            st.success(f"✅ Model Loaded: {MODEL_FILENAME}")
+        # Analysis Mode Selection
+        method = st.radio(
+            "Select Analysis Method:",
+            ("AI Detection (YOLO)", "Manual Blue Fill"),
+            help="Choose 'AI Detection' for raw soil images. Choose 'Manual Blue Fill' if you have manually painted cracks with Blue (0,0,255)."
+        )
+        
+        # Load Model Automatically only if AI mode is needed
+        model = None
+        if method == "AI Detection (YOLO)":
+            model = download_and_load_model()
+            if model:
+                st.success(f"✅ Model Loaded: {MODEL_FILENAME}")
+            else:
+                st.error("❌ Model Failed to Load")
+                st.stop()
         else:
-            st.error("❌ Model Failed to Load")
-            st.stop()
+            st.info("ℹ️ Using Manual Color Extraction Mode")
 
         # Image Uploader
         image_file = st.file_uploader("Upload Soil Image", type=['jpg', 'jpeg', 'png'])
         
         st.header("2. Calibration")
         px_per_mm = st.number_input("Pixels per mm", min_value=1.0, value=4.4333, format="%.4f",
-                                   help="Calibration factor to convert pixels to metric units.")
+                                    help="Calibration factor to convert pixels to metric units.")
         thickness_mm = st.number_input("Layer Thickness (mm)", min_value=1.0, value=8.0, format="%.1f",
                                       help="Thickness of the soil layer for volume estimation.")
         
@@ -248,9 +306,13 @@ def main():
         if not image_file:
             st.error("Please upload an Image file to proceed.")
         else:
-            if model:
-                with st.spinner("Processing Crack Network..."):
-                    metrics, images = process_image(image_file, model, px_per_mm, thickness_mm)
+            # Check model availability only for AI mode
+            if method == "AI Detection (YOLO)" and model is None:
+                st.error("Model is required for AI Detection.")
+            else:
+                with st.spinner(f"Processing Crack Network ({method})..."):
+                    # Pass the selected method to the processing function
+                    metrics, images = process_image(image_file, model, px_per_mm, thickness_mm, method)
                 
                 # --- RESULTS SECTION ---
                 st.success("Analysis Complete")
@@ -260,7 +322,6 @@ def main():
                 
                 with tab1:
                     # Creating a 2x2 Matplotlib Figure
-                    # figsize=(6, 6) ensures the image size is significantly reduced (compact)
                     fig, axes = plt.subplots(2, 2, figsize=(6, 6))
                     
                     # 1. Original Image
