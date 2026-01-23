@@ -76,7 +76,7 @@ def download_and_load_model():
 def process_image(image_file, model, px_per_mm, thickness_mm, method):
     """
     Executes the full image analysis pipeline (Tang et al., 2012 logic).
-    Handles both AI Detection and Manual Blue Fill methods.
+    Handles both AI Detection and Manual Blue Fill methods with mode-specific cleaning.
     """
     # Convert uploaded file to numpy array
     file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
@@ -92,6 +92,7 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
     
     # Initialize the binary map (combined_map)
     combined_map = None
+    min_clean_size = 200 # Default for AI mode
 
     # ---------------------------------------------------------
     # B. Detection Strategy (AI vs Manual)
@@ -111,43 +112,60 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
                 m_resized = cv2.resize(m, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST)
                 structure_map = np.maximum(structure_map, m_resized)
 
-        # 2. Adaptive Thresholding (for fine details)
+        # 2. Adaptive Thresholding
         connectivity_map = cv2.adaptiveThreshold(
             gray_enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
             cv2.THRESH_BINARY_INV, 85, 15
         )
+        # High noise filter for AI mode to remove soil texture noise
         connectivity_clean = remove_small_objects(connectivity_map.astype(bool), min_size=250).astype(np.uint8)
 
         # Fusion
         combined_map = cv2.bitwise_or(structure_map.astype(np.uint8), connectivity_clean)
+        
+        # Set cleaning threshold high for AI to avoid noise
+        min_clean_size = 200
 
     else: # method == "Manual Blue Fill"
         # Create mask for Perfect Blue [R=0, G=0, B=255]
-        # Allowing a tiny margin for anti-aliasing (0-10 for R/G, 240-255 for B)
+        # Allowing slight tolerance for anti-aliasing
         lower_blue = np.array([0, 0, 240]) 
         upper_blue = np.array([10, 10, 255])
         
-        # Determine mask using RGB image
         mask = cv2.inRange(img_rgb, lower_blue, upper_blue)
         combined_map = mask
+        
+        # Set cleaning threshold VERY LOW for manual mode 
+        # (We trust your manual paint, so we keep even small dots/lines)
+        min_clean_size = 10
 
     # ---------------------------------------------------------
-    # C. Cleaning & Refinement (Common Pipeline)
+    # C. Cleaning & Refinement
     # ---------------------------------------------------------
     # Ensure binary format (0 or 255)
     _, combined_map = cv2.threshold(combined_map, 127, 255, cv2.THRESH_BINARY)
     
-    kernel_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed_map = cv2.morphologyEx(combined_map, cv2.MORPH_CLOSE, kernel_bridge, iterations=2)
-    clean_map = remove_small_objects(closed_map.astype(bool), min_size=200).astype(np.uint8)
-    clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=200).astype(np.uint8)
+    # Use smaller kernel for manual mode to preserve fine details
+    kernel_size = (3, 3) if method == "Manual Blue Fill" else (5, 5)
+    kernel_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
+    
+    closed_map = cv2.morphologyEx(combined_map, cv2.MORPH_CLOSE, kernel_bridge, iterations=1)
+    
+    # DYNAMIC CLEANING: Uses 200 for AI (removes noise) but 10 for Manual (keeps small cracks)
+    clean_map = remove_small_objects(closed_map.astype(bool), min_size=min_clean_size).astype(np.uint8)
+    
+    # Remove small holes inside the cracks
+    clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=min_clean_size).astype(np.uint8)
 
     # ---------------------------------------------------------
     # D. Skeletonization
     # ---------------------------------------------------------
     skeleton_base = skeletonize(clean_map)
     # Dilate to ensure connectivity before final skeletonization
-    kernel_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    # Use smaller dilation for manual mode to prevent merging close cracks
+    dilation_kernel = (3, 3) if method == "Manual Blue Fill" else (11, 11)
+    kernel_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, dilation_kernel)
+    
     final_binary_map = cv2.dilate(skeleton_base.astype(np.uint8), kernel_thick, iterations=1)
     final_skeleton = skeletonize(final_binary_map)
 
@@ -181,7 +199,11 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
     # 4. Segment Analysis (N_seg, L_av, D_c)
     skel_segments = skel_int.copy()
     skel_segments[raw_nodes] = 0 
-    valid_segments = remove_small_objects(skel_segments.astype(bool), min_size=8)
+    
+    # Allow smaller segments in manual mode
+    min_seg_size = 5 if method == "Manual Blue Fill" else 8
+    valid_segments = remove_small_objects(skel_segments.astype(bool), min_size=min_seg_size)
+    
     num_segments, _ = cv2.connectedComponents(valid_segments.astype(np.uint8))
     num_segments -= 1
     
@@ -198,179 +220,4 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
     # Volume = Crack Area * Thickness
     est_volume_cm3 = (crack_pixels / (px_per_mm ** 2) / 100) * (thickness_mm / 10)
 
-    metrics = {
-        "R_sc": surface_crack_ratio,
-        "N_c": num_clods,
-        "A_av": avg_clod_area,
-        "N_n": node_density,
-        "N_seg": segment_density,
-        "L_av": avg_crack_length,
-        "D_c": crack_density,
-        "W_av": avg_width,
-        "Volume": est_volume_cm3
-    }
-    
-    # Prepare red overlay for visualization
-    red_mask = np.zeros_like(img_rgb)
-    red_mask[:, :, 0] = 255
-    overlay = cv2.addWeighted(img_rgb, 1.0, 
-                             cv2.bitwise_and(red_mask, red_mask, mask=final_binary_map), 0.6, 0)
-
-    images = {
-        "Original": img_rgb,
-        "Binary Map": final_binary_map,
-        "Skeleton": final_skeleton,
-        "Overlay": overlay,
-        "Nodes": node_coords
-    }
-    
-    return metrics, images
-
-# =============================================================================
-# 4. MAIN APPLICATION UI
-# =============================================================================
-
-def main():
-    st.title("🏗️ Geotechnical Desiccation Crack Analysis")
-    st.markdown("""
-    **Developed by:** Amit Kumar  
-    **Context:** Automated quantification of desiccation crack patterns in clayey soils using image processing techniques 
-    as described by *Tang et al. (2012)*.
-    """)
-    st.divider()
-
-    # --- SIDEBAR: INPUTS ---
-    with st.sidebar:
-        st.header("1. Configuration")
-        
-        # Analysis Mode Selection
-        method = st.radio(
-            "Select Analysis Method:",
-            ("AI Detection (YOLO)", "Manual Blue Fill"),
-            help="Choose 'AI Detection' for raw soil images. Choose 'Manual Blue Fill' if you have manually painted cracks with Blue (0,0,255)."
-        )
-        
-        # Load Model Automatically only if AI mode is needed
-        model = None
-        if method == "AI Detection (YOLO)":
-            model = download_and_load_model()
-            if model:
-                st.success(f"✅ Model Loaded: {MODEL_FILENAME}")
-            else:
-                st.error("❌ Model Failed to Load")
-                st.stop()
-        else:
-            st.info("ℹ️ Using Manual Color Extraction Mode")
-
-        # Image Uploader
-        image_file = st.file_uploader("Upload Soil Image", type=['jpg', 'jpeg', 'png'])
-        
-        st.header("2. Calibration")
-        px_per_mm = st.number_input("Pixels per mm", min_value=1.0, value=4.4333, format="%.4f",
-                                    help="Calibration factor to convert pixels to metric units.")
-        thickness_mm = st.number_input("Layer Thickness (mm)", min_value=1.0, value=8.0, format="%.1f",
-                                      help="Thickness of the soil layer for volume estimation.")
-        
-        run_btn = st.button("🚀 Run Analysis")
-
-    # --- MAIN EXECUTION ---
-    if run_btn:
-        if not image_file:
-            st.error("Please upload an Image file to proceed.")
-        else:
-            # Check model availability only for AI mode
-            if method == "AI Detection (YOLO)" and model is None:
-                st.error("Model is required for AI Detection.")
-            else:
-                with st.spinner(f"Processing Crack Network ({method})..."):
-                    # Pass the selected method to the processing function
-                    metrics, images = process_image(image_file, model, px_per_mm, thickness_mm, method)
-                
-                # --- RESULTS SECTION ---
-                st.success("Analysis Complete")
-                
-                # TAB 1: VISUALIZATION
-                tab1, tab2, tab3 = st.tabs(["📊 2x2 Visual Grid", "📋 Geometric Metrics", "📑 Definitions"])
-                
-                with tab1:
-                    # Creating a 2x2 Matplotlib Figure
-                    fig, axes = plt.subplots(2, 2, figsize=(6, 6))
-                    
-                    # 1. Original Image
-                    axes[0, 0].imshow(images["Original"])
-                    axes[0, 0].set_title("1. Original Image", fontsize=8)
-                    axes[0, 0].axis('off')
-                    
-                    # 2. Binary Map (Black & White)
-                    axes[0, 1].imshow(images["Binary Map"], cmap='gray')
-                    axes[0, 1].set_title("2. Binary Crack Map", fontsize=8)
-                    axes[0, 1].axis('off')
-                    
-                    # 3. Skeleton & Nodes
-                    axes[1, 0].imshow(images["Skeleton"], cmap='gray_r')
-                    node_coords = images["Nodes"]
-                    if len(node_coords) > 0:
-                        axes[1, 0].scatter(node_coords[:, 0], node_coords[:, 1], c='red', s=5)
-                    axes[1, 0].set_title("3. Skeleton & Nodes", fontsize=8)
-                    axes[1, 0].axis('off')
-                    
-                    # 4. Overlay (Segmentation)
-                    axes[1, 1].imshow(images["Overlay"])
-                    axes[1, 1].set_title(f"4. Overlay (R_sc={metrics['R_sc']:.1f}%)", fontsize=8)
-                    axes[1, 1].axis('off')
-
-                    plt.tight_layout()
-                    
-                    # Center the figure in Streamlit
-                    col_spacer1, col_fig, col_spacer2 = st.columns([1, 2, 1])
-                    with col_fig:
-                        st.pyplot(fig)
-
-                # TAB 2: METRICS
-                with tab2:
-                    st.markdown("#### Complete Geometric Parameters")
-                    data = {
-                        "Parameter": [
-                            "Surface crack ratio ($R_{sc}$)", 
-                            "Number of clods ($N_c$)", 
-                            "Average area of clods ($A_{av}$)", 
-                            "Number of nodes per unit area ($N_n$)", 
-                            "Crack segments per unit area ($N_{seg}$)", 
-                            "Average length of cracks ($L_{av}$)", 
-                            "Crack density ($D_c$)", 
-                            "Average width of cracks ($W_{av}$)",
-                            "Estimated Crack Volume ($V_{cr}$)"
-                        ],
-                        "Value": [
-                            f"{metrics['R_sc']:.2f} %",
-                            f"{metrics['N_c']}",
-                            f"{metrics['A_av']:.2f} cm²",
-                            f"{metrics['N_n']:.2f} cm⁻²",
-                            f"{metrics['N_seg']:.2f} cm⁻²",
-                            f"{metrics['L_av']:.2f} cm",
-                            f"{metrics['D_c']:.2f} cm⁻¹",
-                            f"{metrics['W_av']:.4f} cm",
-                            f"{metrics['Volume']:.2f} cm³"
-                        ]
-                    }
-                    st.table(data)
-
-                # TAB 3: DEFINITIONS
-                with tab3:
-                    st.markdown("### 📚 Terminology & Definitions")
-                    st.info("The following definitions are based on **Tang et al. (2012)**.")
-                    
-                    st.markdown("""
-                    * **Surface Crack Ratio ($R_{sc}$):** Defined as the ratio of the crack area to the total surface area of the soil specimen. It is an indicator of the extent of surficial cracking.
-                    * **Number of Clods ($N_c$):** The clod is defined as the independent closed area that is split by cracks (the closed soil area between cracks).
-                    * **Average Area of Clods ($A_{av}$):** The mean surface area of the identified soil clods.
-                    * **Number of Nodes ($N_n$):** The number of intersection nodes (where crack segments meet) or end nodes (dead ends) per unit area.
-                    * **Number of Crack Segments ($N_{seg}$):** The count of distinct crack segments defining the outline of the soil crack pattern per unit area.
-                    * **Average Length of Cracks ($L_{av}$):** The average trace length of the medial axis of crack segments.
-                    * **Crack Density ($D_c$):** Calculated as the total crack length per unit area.
-                    * **Average Width of Cracks ($W_{av}$):** Determined by calculating the shortest distance from a randomly chosen point on one boundary to the opposite boundary of the crack segment.
-                    * **Estimated Crack Volume ($V_{cr}$):** A derived volumetric estimation calculated as the Crack Area multiplied by the specimen thickness.
-                    """)
-
-if __name__ == "__main__":
-    main()
+    metrics
