@@ -75,7 +75,8 @@ def download_and_load_model():
 
 def process_image(image_file, model, px_per_mm, thickness_mm):
     """
-    Executes the full image analysis pipeline (Tang et al., 2012 logic).
+    Executes the full image analysis pipeline (Tang et al., 2012 logic)
+    incorporating Manual Blue Fill (RGB 0,0,255) detection.
     """
     # Convert uploaded file to numpy array
     file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
@@ -91,9 +92,17 @@ def process_image(image_file, model, px_per_mm, thickness_mm):
     img_input = cv2.cvtColor(gray_enhanced, cv2.COLOR_GRAY2BGR)
 
     # ---------------------------------------------------------
-    # B. Crack Detection (YOLO + Thresholding)
+    # B. Crack Detection (YOLO + Thresholding + Manual Blue Mask)
     # ---------------------------------------------------------
-    # 1. YOLO Prediction
+    
+    # 1. Manual Blue Mask Detection
+    # Target Color: RGB(0, 0, 255) -> BGR(255, 0, 0)
+    # We use a range to handle slight compression artifacts if present
+    lower_blue = np.array([240, 0, 0])   # High Blue channel
+    upper_blue = np.array([255, 50, 50]) # Low Green/Red channels
+    manual_mask = cv2.inRange(img_bgr, lower_blue, upper_blue)
+
+    # 2. YOLO Prediction
     results = model.predict(img_input, conf=0.05, save=False, verbose=False)
     
     if results[0].masks is None:
@@ -105,7 +114,7 @@ def process_image(image_file, model, px_per_mm, thickness_mm):
             m_resized = cv2.resize(m, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST)
             structure_map = np.maximum(structure_map, m_resized)
 
-    # 2. Adaptive Thresholding
+    # 3. Adaptive Thresholding
     # Smoothing block size optimized for clay textures
     connectivity_map = cv2.adaptiveThreshold(
         gray_enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
@@ -116,7 +125,11 @@ def process_image(image_file, model, px_per_mm, thickness_mm):
     # ---------------------------------------------------------
     # C. Fusion & Cleaning
     # ---------------------------------------------------------
-    combined_map = cv2.bitwise_or(structure_map.astype(np.uint8), connectivity_clean)
+    # Combine YOLO + Thresholding
+    temp_combined = cv2.bitwise_or(structure_map.astype(np.uint8), connectivity_clean)
+    
+    # Add Manual Mask (Blue Areas) - These are treated as confirmed cracks
+    combined_map = cv2.bitwise_or(temp_combined, manual_mask)
     
     kernel_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     closed_map = cv2.morphologyEx(combined_map, cv2.MORPH_CLOSE, kernel_bridge, iterations=2)
