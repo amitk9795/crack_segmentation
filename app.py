@@ -75,32 +75,30 @@ def download_and_load_model():
 
 def process_image(image_file, model, px_per_mm, thickness_mm, method):
     """
-    Executes the full image analysis pipeline (Tang et al., 2012 logic).
-    Handles both AI Detection and Manual Blue Fill methods with mode-specific cleaning.
+    Executes the image analysis pipeline.
+    - If method == 'AI Detection (YOLO)': Uses the improved logic from your second code snippet.
+    - If method == 'Manual Blue Fill': Uses the working logic from your first code snippet.
     """
     # Convert uploaded file to numpy array
     file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
     img_bgr = cv2.imdecode(file_bytes, 1)
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     
-    # ---------------------------------------------------------
-    # A. Pre-processing
-    # ---------------------------------------------------------
+    # Pre-processing setup
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     gray_enhanced = clahe.apply(gray)
     
-    # Initialize the binary map (combined_map)
+    # Initialize variables specific to method
     combined_map = None
-    min_clean_size = 200 # Default for AI mode
-
-    # ---------------------------------------------------------
-    # B. Detection Strategy (AI vs Manual)
-    # ---------------------------------------------------------
     
+    # ---------------------------------------------------------
+    # METHOD 1: AI DETECTION (Logic from your improved Code 2)
+    # ---------------------------------------------------------
     if method == "AI Detection (YOLO)":
-        # 1. YOLO Prediction
         img_input = cv2.cvtColor(gray_enhanced, cv2.COLOR_GRAY2BGR)
+        
+        # 1. YOLO Prediction
         results = model.predict(img_input, conf=0.05, save=False, verbose=False)
         
         if results[0].masks is None:
@@ -112,28 +110,37 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
                 m_resized = cv2.resize(m, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST)
                 structure_map = np.maximum(structure_map, m_resized)
 
-        # 2. Adaptive Thresholding
+        # 2. Adaptive Thresholding (Optimized for clay textures)
         connectivity_map = cv2.adaptiveThreshold(
             gray_enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
             cv2.THRESH_BINARY_INV, 85, 15
         )
-        # High noise filter for AI mode to remove soil texture noise
         connectivity_clean = remove_small_objects(connectivity_map.astype(bool), min_size=250).astype(np.uint8)
 
-        # Fusion
+        # 3. Fusion & Cleaning (Specific to AI logic)
         combined_map = cv2.bitwise_or(structure_map.astype(np.uint8), connectivity_clean)
         
-        # Set cleaning threshold high for AI to avoid noise
-        min_clean_size = 200
+        kernel_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        # Note: Iterations=2 as per your improved code request
+        closed_map = cv2.morphologyEx(combined_map, cv2.MORPH_CLOSE, kernel_bridge, iterations=2)
+        
+        # Stricter cleaning for AI to reduce noise
+        clean_map = remove_small_objects(closed_map.astype(bool), min_size=200).astype(np.uint8)
+        clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=200).astype(np.uint8)
+        
+        # Dilation logic for AI (Thicker to ensure connectivity)
+        skeleton_base = skeletonize(clean_map)
+        kernel_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        final_binary_map = cv2.dilate(skeleton_base.astype(np.uint8), kernel_thick, iterations=1)
 
-    else: # method == "Manual Blue Fill"
-        # Convert BGR to HSV for more robust "Approximate Blue" detection
+    # ---------------------------------------------------------
+    # METHOD 2: MANUAL BLUE FILL (Logic from your original Code 1)
+    # ---------------------------------------------------------
+    else:
+        # Convert BGR to HSV for robust "Approximate Blue" detection
         hsv_img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
         
         # Define range for Blue in HSV
-        # Hue (H): Blue is approx 120. We allow 90 to 150 (covers cyan-blue to purple-blue)
-        # Saturation (S): Must be reasonably high (>50) to ignore grey/white
-        # Value (V): Must be reasonably high (>50) to ignore black
         lower_blue = np.array([90, 50, 50])
         upper_blue = np.array([150, 255, 255])
         
@@ -141,43 +148,27 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
         mask = cv2.inRange(hsv_img, lower_blue, upper_blue)
         combined_map = mask
         
-        # Set cleaning threshold VERY LOW for manual mode 
-        # (We trust your manual paint, so we keep even small dots/lines)
-        min_clean_size = 10
+        # Cleaning & Refinement (Gentler for manual input)
+        _, combined_map = cv2.threshold(combined_map, 127, 255, cv2.THRESH_BINARY)
+        
+        # Smaller kernel for manual mode to preserve fine details
+        kernel_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        closed_map = cv2.morphologyEx(combined_map, cv2.MORPH_CLOSE, kernel_bridge, iterations=1)
+        
+        # Minimal cleaning (keep small dots if manually painted)
+        clean_map = remove_small_objects(closed_map.astype(bool), min_size=10).astype(np.uint8)
+        clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=10).astype(np.uint8)
+
+        # Dilation logic for Manual (Thinner to preserve drawing accuracy)
+        skeleton_base = skeletonize(clean_map)
+        kernel_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        final_binary_map = cv2.dilate(skeleton_base.astype(np.uint8), kernel_thick, iterations=1)
 
     # ---------------------------------------------------------
-    # C. Cleaning & Refinement
+    # D. Final Skeletonization & Metrics (Common)
     # ---------------------------------------------------------
-    # Ensure binary format (0 or 255)
-    _, combined_map = cv2.threshold(combined_map, 127, 255, cv2.THRESH_BINARY)
-    
-    # Use smaller kernel for manual mode to preserve fine details
-    kernel_size = (3, 3) if method == "Manual Blue Fill" else (5, 5)
-    kernel_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
-    
-    closed_map = cv2.morphologyEx(combined_map, cv2.MORPH_CLOSE, kernel_bridge, iterations=1)
-    
-    # DYNAMIC CLEANING: Uses 200 for AI (removes noise) but 10 for Manual (keeps small cracks)
-    clean_map = remove_small_objects(closed_map.astype(bool), min_size=min_clean_size).astype(np.uint8)
-    
-    # Remove small holes inside the cracks
-    clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=min_clean_size).astype(np.uint8)
-
-    # ---------------------------------------------------------
-    # D. Skeletonization
-    # ---------------------------------------------------------
-    skeleton_base = skeletonize(clean_map)
-    # Dilate to ensure connectivity before final skeletonization
-    # Use smaller dilation for manual mode to prevent merging close cracks
-    dilation_kernel = (3, 3) if method == "Manual Blue Fill" else (11, 11)
-    kernel_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, dilation_kernel)
-    
-    final_binary_map = cv2.dilate(skeleton_base.astype(np.uint8), kernel_thick, iterations=1)
     final_skeleton = skeletonize(final_binary_map)
 
-    # ---------------------------------------------------------
-    # E. Metric Calculations
-    # ---------------------------------------------------------
     h, w = final_binary_map.shape
     total_area_cm2 = (h * w) / (px_per_mm ** 2) / 100
 
@@ -206,7 +197,7 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
     skel_segments = skel_int.copy()
     skel_segments[raw_nodes] = 0 
     
-    # Allow smaller segments in manual mode
+    # Use smaller segment threshold for manual mode
     min_seg_size = 5 if method == "Manual Blue Fill" else 8
     valid_segments = remove_small_objects(skel_segments.astype(bool), min_size=min_seg_size)
     
@@ -295,7 +286,7 @@ def main():
         
         st.header("2. Calibration")
         px_per_mm = st.number_input("Pixels per mm", min_value=1.0, value=4.4333, format="%.4f",
-                                    help="Calibration factor to convert pixels to metric units.")
+                                   help="Calibration factor to convert pixels to metric units.")
         thickness_mm = st.number_input("Layer Thickness (mm)", min_value=1.0, value=8.0, format="%.1f",
                                       help="Thickness of the soil layer for volume estimation.")
         
