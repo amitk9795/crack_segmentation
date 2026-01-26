@@ -76,8 +76,8 @@ def download_and_load_model():
 def process_image(image_file, model, px_per_mm, thickness_mm, method):
     """
     Executes the image analysis pipeline.
-    Uses Direct Binary Quantification to ensure AI and Manual results match.
-    Includes improved Skeletonization bridging.
+    - AI MODE: Reverted to the robust previous version (Thick Dilation).
+    - MANUAL MODE: Uses the lightweight version (Direct Detection).
     """
     # Convert uploaded file to numpy array
     file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
@@ -89,11 +89,10 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     gray_enhanced = clahe.apply(gray)
     
-    # Variable to hold the raw binary detection
-    raw_binary_map = None
+    final_binary_map = None
     
     # ---------------------------------------------------------
-    # METHOD 1: AI DETECTION (YOLO)
+    # METHOD 1: AI DETECTION (YOLO) - RESTORED TO PREVIOUS VERSION
     # ---------------------------------------------------------
     if method == "AI Detection (YOLO)":
         img_input = cv2.cvtColor(gray_enhanced, cv2.COLOR_GRAY2BGR)
@@ -110,23 +109,31 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
                 m_resized = cv2.resize(m, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST)
                 structure_map = np.maximum(structure_map, m_resized)
 
-        # 2. Adaptive Thresholding (for fine details)
+        # 2. Adaptive Thresholding (Optimized for clay textures)
         connectivity_map = cv2.adaptiveThreshold(
             gray_enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
             cv2.THRESH_BINARY_INV, 85, 15
         )
-        # Filter noise from thresholding
-        connectivity_clean = remove_small_objects(connectivity_map.astype(bool), min_size=150).astype(np.uint8)
+        connectivity_clean = remove_small_objects(connectivity_map.astype(bool), min_size=250).astype(np.uint8)
 
-        # 3. Fusion
-        raw_binary_map = cv2.bitwise_or(structure_map.astype(np.uint8), connectivity_clean)
+        # 3. Fusion & Cleaning (Specific to AI logic)
+        combined_map = cv2.bitwise_or(structure_map.astype(np.uint8), connectivity_clean)
         
-        # 4. Refinement 
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        raw_binary_map = cv2.morphologyEx(raw_binary_map, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+        kernel_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        # Note: Iterations=2 was the setting that worked well for AI
+        closed_map = cv2.morphologyEx(combined_map, cv2.MORPH_CLOSE, kernel_bridge, iterations=2)
+        
+        # Stricter cleaning for AI to reduce noise
+        clean_map = remove_small_objects(closed_map.astype(bool), min_size=200).astype(np.uint8)
+        clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=200).astype(np.uint8)
+        
+        # 4. Reconstruction via Dilation (The key step for AI visibility)
+        skeleton_base = skeletonize(clean_map)
+        kernel_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        final_binary_map = cv2.dilate(skeleton_base.astype(np.uint8), kernel_thick, iterations=1)
 
     # ---------------------------------------------------------
-    # METHOD 2: MANUAL BLUE FILL
+    # METHOD 2: MANUAL BLUE FILL (As confirmed working)
     # ---------------------------------------------------------
     else:
         # Convert BGR to HSV
@@ -142,34 +149,24 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
         # Minimal refinement for manual (trust the user's paint)
         kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         raw_binary_map = cv2.morphologyEx(raw_binary_map, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+        
+        # Standard cleaning
+        _, binary_base = cv2.threshold(raw_binary_map, 127, 255, cv2.THRESH_BINARY)
+        clean_map = remove_small_objects(binary_base.astype(bool), min_size=50).astype(np.uint8)
+        clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=50).astype(np.uint8)
+        
+        # Direct assignment (No artificial dilation for manual)
+        final_binary_map = clean_map
 
     # ---------------------------------------------------------
-    # C. Common Post-Processing (Standardization)
+    # D. Final Skeletonization & Metrics (Common)
     # ---------------------------------------------------------
-    # Ensure binary format (0 or 255)
-    _, binary_base = cv2.threshold(raw_binary_map, 127, 255, cv2.THRESH_BINARY)
-    
-    # Final Cleaning 
-    clean_map = remove_small_objects(binary_base.astype(bool), min_size=50).astype(np.uint8)
-    clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=50).astype(np.uint8)
-    
-    # Use 'clean_map' as the true representation of area and width.
-    final_binary_map = clean_map 
-
-    # ---------------------------------------------------------
-    # D. Robust Skeletonization
-    # ---------------------------------------------------------
-    # Pre-process specifically for skeletonization to ensure connectivity
-    # We dilate slightly then close holes to bridge tiny 1px gaps that break skeletons
+    # Generate Skeleton for calculations (re-skeletonize the final map)
+    # We bridge small gaps first to ensure skeleton continuity
     skel_prep_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
     skel_prep = cv2.morphologyEx(final_binary_map, cv2.MORPH_CLOSE, skel_prep_kernel, iterations=2)
-    
-    # Generate Skeleton
     final_skeleton = skeletonize(skel_prep.astype(bool)).astype(np.uint8)
 
-    # ---------------------------------------------------------
-    # E. Metric Calculations
-    # ---------------------------------------------------------
     h, w = final_binary_map.shape
     total_area_cm2 = (h * w) / (px_per_mm ** 2) / 100
 
@@ -185,42 +182,40 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
     avg_clod_area = (np.sum(clod_mask) / num_clods) / (px_per_mm ** 2) / 100 if num_clods > 0 else 0
 
     # 3. Node Analysis (N_n)
-    # Use convolution to find intersections
-    # 1-pixel skeleton: Intersections have > 2 neighbors
+    skel_int = final_skeleton.astype(int)
     conv = np.array([[1,1,1],[1,1,1],[1,1,1]])
-    neighbor_count = ndimage.convolve(final_skeleton, conv, mode='constant', cval=0)
+    neighbor_count = ndimage.convolve(skel_int, conv, mode='constant', cval=0)
     
-    # Valid skeleton pixels are 1. Center pixel is counted in neighbor_count (so intersection is > 3)
-    # Logic: If pixel is 1, and sum of 3x3 window is > 3 (itself + 2 neighbors), it's a junction/node.
-    # Note: Endpoints have sum=2 (itself + 1 neighbor). Lines have sum=3 (itself + 2 neighbors).
-    raw_nodes = (final_skeleton == 1) & (neighbor_count > 3)
+    # Intersections have > 3 neighbors (center + >2 arms)
+    raw_nodes = (skel_int == 1) & (neighbor_count > 3)
     
-    # Group clustered nodes
     num_node_clusters, labels, stats, centroids = cv2.connectedComponentsWithStats(raw_nodes.astype(np.uint8))
     real_node_count = num_node_clusters - 1
     node_density = real_node_count / total_area_cm2
     node_coords = centroids[1:]
 
     # 4. Segment Analysis (N_seg, L_av, D_c)
-    skel_segments = final_skeleton.copy()
-    # Dilate nodes to break the skeleton at junctions
+    skel_segments = skel_int.copy()
+    
+    # Dilate nodes to break skeleton
     node_mask = cv2.dilate(raw_nodes.astype(np.uint8), np.ones((3,3), np.uint8), iterations=1)
     skel_segments[node_mask == 1] = 0 
     
-    valid_segments = remove_small_objects(skel_segments.astype(bool), min_size=5)
+    # Use different segment threshold based on method
+    min_seg_size = 5 if method == "Manual Blue Fill" else 8
+    valid_segments = remove_small_objects(skel_segments.astype(bool), min_size=min_seg_size)
+    
     num_segments, _ = cv2.connectedComponents(valid_segments.astype(np.uint8))
     num_segments -= 1
     
     segment_density = num_segments / total_area_cm2
-    
     total_len_cm = np.sum(final_skeleton) / px_per_mm / 10
     avg_crack_length = total_len_cm / num_segments if num_segments > 0 else 0
     crack_density = total_len_cm / total_area_cm2
 
     # 5. Width & Volume (W_av, Volume)
     dist_map = cv2.distanceTransform(final_binary_map, cv2.DIST_L2, 5)
-    # Mask distance map with skeleton to get width at centerlines
-    width_samples = dist_map[final_skeleton == 1] * 2 
+    width_samples = dist_map[final_skeleton == 1] * 2
     avg_width = (np.mean(width_samples) / px_per_mm) / 10 if len(width_samples) > 0 else 0
     
     # Volume = Crack Area * Thickness
@@ -335,13 +330,13 @@ def main():
                     axes[0, 1].axis('off')
                     
                     # 3. Skeleton & Nodes
-                    # Use dilate on skeleton ONLY for visualization so it's visible in the plot
+                    # Visualize thickened skeleton so it is visible in the plot
                     vis_skeleton = cv2.dilate(images["Skeleton"], np.ones((2,2), np.uint8), iterations=1)
                     axes[1, 0].imshow(vis_skeleton, cmap='gray_r')
                     
                     node_coords = images["Nodes"]
                     if len(node_coords) > 0:
-                        axes[1, 0].scatter(node_coords[:, 0], node_coords[:, 1], c='red', s=10) # increased size
+                        axes[1, 0].scatter(node_coords[:, 0], node_coords[:, 1], c='red', s=10)
                     axes[1, 0].set_title("3. Skeleton & Nodes", fontsize=8)
                     axes[1, 0].axis('off')
                     
