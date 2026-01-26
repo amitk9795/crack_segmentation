@@ -77,6 +77,7 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
     """
     Executes the image analysis pipeline.
     Uses Direct Binary Quantification to ensure AI and Manual results match.
+    Includes improved Skeletonization bridging.
     """
     # Convert uploaded file to numpy array
     file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
@@ -120,8 +121,7 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
         # 3. Fusion
         raw_binary_map = cv2.bitwise_or(structure_map.astype(np.uint8), connectivity_clean)
         
-        # 4. Refinement (Connecting gaps without artificial thickening)
-        # We use a modest kernel to close small gaps, but NOT the massive dilation from before.
+        # 4. Refinement 
         kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         raw_binary_map = cv2.morphologyEx(raw_binary_map, cv2.MORPH_CLOSE, kernel_close, iterations=1)
 
@@ -149,26 +149,31 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
     # Ensure binary format (0 or 255)
     _, binary_base = cv2.threshold(raw_binary_map, 127, 255, cv2.THRESH_BINARY)
     
-    # Final Cleaning (Unified parameters for fair comparison)
-    # We remove only very small noise.
+    # Final Cleaning 
     clean_map = remove_small_objects(binary_base.astype(bool), min_size=50).astype(np.uint8)
     clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=50).astype(np.uint8)
     
-    # NOTE: We do NOT dilate the skeleton to recreate the map. 
-    # We use 'clean_map' as the true representation of area and width.
+    # Use 'clean_map' as the true representation of area and width.
     final_binary_map = clean_map 
 
     # ---------------------------------------------------------
-    # D. Metric Calculations
+    # D. Robust Skeletonization
     # ---------------------------------------------------------
-    # Generate Skeleton for Length/Node calculations
-    final_skeleton = skeletonize(final_binary_map)
+    # Pre-process specifically for skeletonization to ensure connectivity
+    # We dilate slightly then close holes to bridge tiny 1px gaps that break skeletons
+    skel_prep_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    skel_prep = cv2.morphologyEx(final_binary_map, cv2.MORPH_CLOSE, skel_prep_kernel, iterations=2)
+    
+    # Generate Skeleton
+    final_skeleton = skeletonize(skel_prep.astype(bool)).astype(np.uint8)
 
+    # ---------------------------------------------------------
+    # E. Metric Calculations
+    # ---------------------------------------------------------
     h, w = final_binary_map.shape
     total_area_cm2 = (h * w) / (px_per_mm ** 2) / 100
 
     # 1. Surface Crack Ratio (R_sc)
-    # Calculated directly from the pixels detected
     crack_pixels = np.sum(final_binary_map)
     surface_crack_ratio = (crack_pixels / (h * w)) * 100
 
@@ -180,23 +185,25 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
     avg_clod_area = (np.sum(clod_mask) / num_clods) / (px_per_mm ** 2) / 100 if num_clods > 0 else 0
 
     # 3. Node Analysis (N_n)
-    skel_int = final_skeleton.astype(int)
+    # Use convolution to find intersections
+    # 1-pixel skeleton: Intersections have > 2 neighbors
     conv = np.array([[1,1,1],[1,1,1],[1,1,1]])
-    neighbor_count = ndimage.convolve(skel_int, conv, mode='constant', cval=0)
-    # Nodes are intersection points (>2 neighbors usually, >3 for strict cross) or endpoints (1 neighbor)
-    # Tang et al often focus on intersections. Here we count junctions > 2 neighbors
-    raw_nodes = (skel_int == 1) & (neighbor_count > 2)
+    neighbor_count = ndimage.convolve(final_skeleton, conv, mode='constant', cval=0)
     
-    # Group clustered nodes to avoid double counting single junctions
+    # Valid skeleton pixels are 1. Center pixel is counted in neighbor_count (so intersection is > 3)
+    # Logic: If pixel is 1, and sum of 3x3 window is > 3 (itself + 2 neighbors), it's a junction/node.
+    # Note: Endpoints have sum=2 (itself + 1 neighbor). Lines have sum=3 (itself + 2 neighbors).
+    raw_nodes = (final_skeleton == 1) & (neighbor_count > 3)
+    
+    # Group clustered nodes
     num_node_clusters, labels, stats, centroids = cv2.connectedComponentsWithStats(raw_nodes.astype(np.uint8))
     real_node_count = num_node_clusters - 1
     node_density = real_node_count / total_area_cm2
     node_coords = centroids[1:]
 
     # 4. Segment Analysis (N_seg, L_av, D_c)
-    # Break skeleton at nodes to count segments
-    skel_segments = skel_int.copy()
-    # Dilate nodes slightly to ensure they break the skeleton
+    skel_segments = final_skeleton.copy()
+    # Dilate nodes to break the skeleton at junctions
     node_mask = cv2.dilate(raw_nodes.astype(np.uint8), np.ones((3,3), np.uint8), iterations=1)
     skel_segments[node_mask == 1] = 0 
     
@@ -206,15 +213,14 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
     
     segment_density = num_segments / total_area_cm2
     
-    # Length is sum of skeleton pixels
     total_len_cm = np.sum(final_skeleton) / px_per_mm / 10
     avg_crack_length = total_len_cm / num_segments if num_segments > 0 else 0
     crack_density = total_len_cm / total_area_cm2
 
     # 5. Width & Volume (W_av, Volume)
-    # Distance transform on the ACTUAL binary map, sampled at skeleton points
     dist_map = cv2.distanceTransform(final_binary_map, cv2.DIST_L2, 5)
-    width_samples = dist_map[final_skeleton] * 2 # Distance is radius, so x2 for width
+    # Mask distance map with skeleton to get width at centerlines
+    width_samples = dist_map[final_skeleton == 1] * 2 
     avg_width = (np.mean(width_samples) / px_per_mm) / 10 if len(width_samples) > 0 else 0
     
     # Volume = Crack Area * Thickness
@@ -329,10 +335,13 @@ def main():
                     axes[0, 1].axis('off')
                     
                     # 3. Skeleton & Nodes
-                    axes[1, 0].imshow(images["Skeleton"], cmap='gray_r')
+                    # Use dilate on skeleton ONLY for visualization so it's visible in the plot
+                    vis_skeleton = cv2.dilate(images["Skeleton"], np.ones((2,2), np.uint8), iterations=1)
+                    axes[1, 0].imshow(vis_skeleton, cmap='gray_r')
+                    
                     node_coords = images["Nodes"]
                     if len(node_coords) > 0:
-                        axes[1, 0].scatter(node_coords[:, 0], node_coords[:, 1], c='red', s=5)
+                        axes[1, 0].scatter(node_coords[:, 0], node_coords[:, 1], c='red', s=10) # increased size
                     axes[1, 0].set_title("3. Skeleton & Nodes", fontsize=8)
                     axes[1, 0].axis('off')
                     
