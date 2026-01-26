@@ -8,3 +8,5 @@ scipy
 pillow
 gdown
 dill
+pandas
+xlsxwriter
