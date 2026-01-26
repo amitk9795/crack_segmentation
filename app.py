@@ -7,6 +7,8 @@ from skimage.morphology import skeletonize, remove_small_objects, remove_small_h
 from scipy import ndimage
 import os
 import gdown
+import pandas as pd
+import io
 
 # =============================================================================
 # 1. PAGE CONFIGURATION & STYLING
@@ -292,7 +294,7 @@ def main():
         px_per_mm = st.number_input("Pixels per mm", min_value=1.0, value=4.4333, format="%.4f",
                                    help="Calibration factor to convert pixels to metric units.")
         thickness_mm = st.number_input("Layer Thickness (mm)", min_value=1.0, value=8.0, format="%.1f",
-                                      help="Thickness of the soil layer for volume estimation.")
+                                     help="Thickness of the soil layer for volume estimation.")
         
         run_btn = st.button("🚀 Run Analysis")
 
@@ -355,31 +357,75 @@ def main():
                 # TAB 2: METRICS
                 with tab2:
                     st.markdown("#### Complete Geometric Parameters")
+                    
+                    # Prepare data for DataFrame
                     data = {
                         "Parameter": [
-                            "Surface crack ratio ($R_{sc}$)", 
-                            "Number of clods ($N_c$)", 
-                            "Average area of clods ($A_{av}$)", 
-                            "Number of nodes per unit area ($N_n$)", 
-                            "Crack segments per unit area ($N_{seg}$)", 
-                            "Average length of cracks ($L_{av}$)", 
-                            "Crack density ($D_c$)", 
-                            "Average width of cracks ($W_{av}$)",
-                            "Estimated Crack Volume ($V_{cr}$)"
+                            "Surface crack ratio (R_sc)", 
+                            "Number of clods (N_c)", 
+                            "Average area of clods (A_av)", 
+                            "Number of nodes per unit area (N_n)", 
+                            "Crack segments per unit area (N_seg)", 
+                            "Average length of cracks (L_av)", 
+                            "Crack density (D_c)", 
+                            "Average width of cracks (W_av)",
+                            "Estimated Crack Volume (V_cr)"
                         ],
                         "Value": [
-                            f"{metrics['R_sc']:.2f} %",
-                            f"{metrics['N_c']}",
-                            f"{metrics['A_av']:.2f} cm²",
-                            f"{metrics['N_n']:.2f} cm⁻²",
-                            f"{metrics['N_seg']:.2f} cm⁻²",
-                            f"{metrics['L_av']:.2f} cm",
-                            f"{metrics['D_c']:.2f} cm⁻¹",
-                            f"{metrics['W_av']:.4f} cm",
-                            f"{metrics['Volume']:.2f} cm³"
+                            metrics['R_sc'],
+                            metrics['N_c'],
+                            metrics['A_av'],
+                            metrics['N_n'],
+                            metrics['N_seg'],
+                            metrics['L_av'],
+                            metrics['D_c'],
+                            metrics['W_av'],
+                            metrics['Volume']
+                        ],
+                        "Unit": [
+                            "%",
+                            "-",
+                            "cm²",
+                            "cm⁻²",
+                            "cm⁻²",
+                            "cm",
+                            "cm⁻¹",
+                            "cm",
+                            "cm³"
                         ]
                     }
-                    st.table(data)
+                    
+                    # Create DataFrame
+                    df_metrics = pd.DataFrame(data)
+                    
+                    # Display as interactive Table (allows copying)
+                    st.dataframe(
+                        df_metrics.style.format({"Value": "{:.4f}"}), 
+                        use_container_width=True, 
+                        hide_index=True
+                    )
+                    
+                    # Create Excel file in memory
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                        df_metrics.to_excel(writer, index=False, sheet_name='Geometric Parameters')
+                        
+                        # Adjust column width for better readability in the downloaded file
+                        workbook = writer.book
+                        worksheet = writer.sheets['Geometric Parameters']
+                        format_header = workbook.add_format({'bold': True, 'align': 'center', 'bg_color': '#D3D3D3'})
+                        
+                        for col_num, value in enumerate(df_metrics.columns.values):
+                            worksheet.write(0, col_num, value, format_header)
+                            worksheet.set_column(col_num, col_num, 25)
+
+                    # Download Button
+                    st.download_button(
+                        label="📥 Download Results as Excel",
+                        data=buffer.getvalue(),
+                        file_name="Geometric_Parameters.xlsx",
+                        mime="application/vnd.ms-excel"
+                    )
 
                 # TAB 3: DEFINITIONS
                 with tab3:
