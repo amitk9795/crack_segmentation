@@ -76,8 +76,7 @@ def download_and_load_model():
 def process_image(image_file, model, px_per_mm, thickness_mm, method):
     """
     Executes the image analysis pipeline.
-    - If method == 'AI Detection (YOLO)': Uses the improved logic from your second code snippet.
-    - If method == 'Manual Blue Fill': Uses the working logic from your first code snippet.
+    Uses Direct Binary Quantification to ensure AI and Manual results match.
     """
     # Convert uploaded file to numpy array
     file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
@@ -89,11 +88,11 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     gray_enhanced = clahe.apply(gray)
     
-    # Initialize variables specific to method
-    combined_map = None
+    # Variable to hold the raw binary detection
+    raw_binary_map = None
     
     # ---------------------------------------------------------
-    # METHOD 1: AI DETECTION (Logic from your improved Code 2)
+    # METHOD 1: AI DETECTION (YOLO)
     # ---------------------------------------------------------
     if method == "AI Detection (YOLO)":
         img_input = cv2.cvtColor(gray_enhanced, cv2.COLOR_GRAY2BGR)
@@ -110,108 +109,112 @@ def process_image(image_file, model, px_per_mm, thickness_mm, method):
                 m_resized = cv2.resize(m, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST)
                 structure_map = np.maximum(structure_map, m_resized)
 
-        # 2. Adaptive Thresholding (Optimized for clay textures)
+        # 2. Adaptive Thresholding (for fine details)
         connectivity_map = cv2.adaptiveThreshold(
             gray_enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
             cv2.THRESH_BINARY_INV, 85, 15
         )
-        connectivity_clean = remove_small_objects(connectivity_map.astype(bool), min_size=250).astype(np.uint8)
+        # Filter noise from thresholding
+        connectivity_clean = remove_small_objects(connectivity_map.astype(bool), min_size=150).astype(np.uint8)
 
-        # 3. Fusion & Cleaning (Specific to AI logic)
-        combined_map = cv2.bitwise_or(structure_map.astype(np.uint8), connectivity_clean)
+        # 3. Fusion
+        raw_binary_map = cv2.bitwise_or(structure_map.astype(np.uint8), connectivity_clean)
         
-        kernel_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        # Note: Iterations=2 as per your improved code request
-        closed_map = cv2.morphologyEx(combined_map, cv2.MORPH_CLOSE, kernel_bridge, iterations=2)
-        
-        # Stricter cleaning for AI to reduce noise
-        clean_map = remove_small_objects(closed_map.astype(bool), min_size=200).astype(np.uint8)
-        clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=200).astype(np.uint8)
-        
-        # Dilation logic for AI (Thicker to ensure connectivity)
-        skeleton_base = skeletonize(clean_map)
-        kernel_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-        final_binary_map = cv2.dilate(skeleton_base.astype(np.uint8), kernel_thick, iterations=1)
+        # 4. Refinement (Connecting gaps without artificial thickening)
+        # We use a modest kernel to close small gaps, but NOT the massive dilation from before.
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        raw_binary_map = cv2.morphologyEx(raw_binary_map, cv2.MORPH_CLOSE, kernel_close, iterations=1)
 
     # ---------------------------------------------------------
-    # METHOD 2: MANUAL BLUE FILL (Logic from your original Code 1)
+    # METHOD 2: MANUAL BLUE FILL
     # ---------------------------------------------------------
     else:
-        # Convert BGR to HSV for robust "Approximate Blue" detection
+        # Convert BGR to HSV
         hsv_img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
         
-        # Define range for Blue in HSV
+        # Define range for Blue
         lower_blue = np.array([90, 50, 50])
         upper_blue = np.array([150, 255, 255])
         
-        # Create mask based on HSV range
-        mask = cv2.inRange(hsv_img, lower_blue, upper_blue)
-        combined_map = mask
+        # Create mask
+        raw_binary_map = cv2.inRange(hsv_img, lower_blue, upper_blue)
         
-        # Cleaning & Refinement (Gentler for manual input)
-        _, combined_map = cv2.threshold(combined_map, 127, 255, cv2.THRESH_BINARY)
-        
-        # Smaller kernel for manual mode to preserve fine details
-        kernel_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        closed_map = cv2.morphologyEx(combined_map, cv2.MORPH_CLOSE, kernel_bridge, iterations=1)
-        
-        # Minimal cleaning (keep small dots if manually painted)
-        clean_map = remove_small_objects(closed_map.astype(bool), min_size=10).astype(np.uint8)
-        clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=10).astype(np.uint8)
-
-        # Dilation logic for Manual (Thinner to preserve drawing accuracy)
-        skeleton_base = skeletonize(clean_map)
-        kernel_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        final_binary_map = cv2.dilate(skeleton_base.astype(np.uint8), kernel_thick, iterations=1)
+        # Minimal refinement for manual (trust the user's paint)
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        raw_binary_map = cv2.morphologyEx(raw_binary_map, cv2.MORPH_CLOSE, kernel_close, iterations=1)
 
     # ---------------------------------------------------------
-    # D. Final Skeletonization & Metrics (Common)
+    # C. Common Post-Processing (Standardization)
     # ---------------------------------------------------------
+    # Ensure binary format (0 or 255)
+    _, binary_base = cv2.threshold(raw_binary_map, 127, 255, cv2.THRESH_BINARY)
+    
+    # Final Cleaning (Unified parameters for fair comparison)
+    # We remove only very small noise.
+    clean_map = remove_small_objects(binary_base.astype(bool), min_size=50).astype(np.uint8)
+    clean_map = remove_small_holes(clean_map.astype(bool), area_threshold=50).astype(np.uint8)
+    
+    # NOTE: We do NOT dilate the skeleton to recreate the map. 
+    # We use 'clean_map' as the true representation of area and width.
+    final_binary_map = clean_map 
+
+    # ---------------------------------------------------------
+    # D. Metric Calculations
+    # ---------------------------------------------------------
+    # Generate Skeleton for Length/Node calculations
     final_skeleton = skeletonize(final_binary_map)
 
     h, w = final_binary_map.shape
     total_area_cm2 = (h * w) / (px_per_mm ** 2) / 100
 
-    # 1. Clod Analysis (N_c, A_av)
+    # 1. Surface Crack Ratio (R_sc)
+    # Calculated directly from the pixels detected
+    crack_pixels = np.sum(final_binary_map)
+    surface_crack_ratio = (crack_pixels / (h * w)) * 100
+
+    # 2. Clod Analysis (N_c, A_av)
     clod_mask = 1 - final_binary_map
     clod_mask = remove_small_objects(clod_mask.astype(bool), min_size=20).astype(np.uint8)
     num_clods, _ = cv2.connectedComponents(clod_mask)
     num_clods -= 1  # remove background
     avg_clod_area = (np.sum(clod_mask) / num_clods) / (px_per_mm ** 2) / 100 if num_clods > 0 else 0
 
-    # 2. Surface Crack Ratio (R_sc)
-    crack_pixels = np.sum(final_binary_map)
-    surface_crack_ratio = (crack_pixels / (h * w)) * 100
-
     # 3. Node Analysis (N_n)
     skel_int = final_skeleton.astype(int)
     conv = np.array([[1,1,1],[1,1,1],[1,1,1]])
     neighbor_count = ndimage.convolve(skel_int, conv, mode='constant', cval=0)
-    raw_nodes = (skel_int == 1) & (neighbor_count > 3)
+    # Nodes are intersection points (>2 neighbors usually, >3 for strict cross) or endpoints (1 neighbor)
+    # Tang et al often focus on intersections. Here we count junctions > 2 neighbors
+    raw_nodes = (skel_int == 1) & (neighbor_count > 2)
+    
+    # Group clustered nodes to avoid double counting single junctions
     num_node_clusters, labels, stats, centroids = cv2.connectedComponentsWithStats(raw_nodes.astype(np.uint8))
     real_node_count = num_node_clusters - 1
     node_density = real_node_count / total_area_cm2
     node_coords = centroids[1:]
 
     # 4. Segment Analysis (N_seg, L_av, D_c)
+    # Break skeleton at nodes to count segments
     skel_segments = skel_int.copy()
-    skel_segments[raw_nodes] = 0 
+    # Dilate nodes slightly to ensure they break the skeleton
+    node_mask = cv2.dilate(raw_nodes.astype(np.uint8), np.ones((3,3), np.uint8), iterations=1)
+    skel_segments[node_mask == 1] = 0 
     
-    # Use smaller segment threshold for manual mode
-    min_seg_size = 5 if method == "Manual Blue Fill" else 8
-    valid_segments = remove_small_objects(skel_segments.astype(bool), min_size=min_seg_size)
-    
+    valid_segments = remove_small_objects(skel_segments.astype(bool), min_size=5)
     num_segments, _ = cv2.connectedComponents(valid_segments.astype(np.uint8))
     num_segments -= 1
     
     segment_density = num_segments / total_area_cm2
+    
+    # Length is sum of skeleton pixels
     total_len_cm = np.sum(final_skeleton) / px_per_mm / 10
     avg_crack_length = total_len_cm / num_segments if num_segments > 0 else 0
     crack_density = total_len_cm / total_area_cm2
 
     # 5. Width & Volume (W_av, Volume)
+    # Distance transform on the ACTUAL binary map, sampled at skeleton points
     dist_map = cv2.distanceTransform(final_binary_map, cv2.DIST_L2, 5)
-    width_samples = dist_map[final_skeleton] * 2
+    width_samples = dist_map[final_skeleton] * 2 # Distance is radius, so x2 for width
     avg_width = (np.mean(width_samples) / px_per_mm) / 10 if len(width_samples) > 0 else 0
     
     # Volume = Crack Area * Thickness
@@ -380,14 +383,14 @@ def main():
                     st.info("The following definitions are based on **Tang et al. (2012)**.")
                     
                     st.markdown("""
-                    * **Surface Crack Ratio ($R_{sc}$):** Defined as the ratio of the crack area to the total surface area of the soil specimen. It is an indicator of the extent of surficial cracking.
-                    * **Number of Clods ($N_c$):** The clod is defined as the independent closed area that is split by cracks (the closed soil area between cracks).
+                    * **Surface Crack Ratio ($R_{sc}$):** Defined as the ratio of the crack area to the total surface area of the soil specimen.
+                    * **Number of Clods ($N_c$):** The clod is defined as the independent closed area that is split by cracks.
                     * **Average Area of Clods ($A_{av}$):** The mean surface area of the identified soil clods.
-                    * **Number of Nodes ($N_n$):** The number of intersection nodes (where crack segments meet) or end nodes (dead ends) per unit area.
-                    * **Number of Crack Segments ($N_{seg}$):** The count of distinct crack segments defining the outline of the soil crack pattern per unit area.
+                    * **Number of Nodes ($N_n$):** The number of intersection nodes (where crack segments meet) or end nodes.
+                    * **Number of Crack Segments ($N_{seg}$):** The count of distinct crack segments defining the outline of the soil crack pattern.
                     * **Average Length of Cracks ($L_{av}$):** The average trace length of the medial axis of crack segments.
                     * **Crack Density ($D_c$):** Calculated as the total crack length per unit area.
-                    * **Average Width of Cracks ($W_{av}$):** Determined by calculating the shortest distance from a randomly chosen point on one boundary to the opposite boundary of the crack segment.
+                    * **Average Width of Cracks ($W_{av}$):** Determined by calculating the shortest distance from a randomly chosen point on one boundary to the opposite boundary.
                     * **Estimated Crack Volume ($V_{cr}$):** A derived volumetric estimation calculated as the Crack Area multiplied by the specimen thickness.
                     """)
 
