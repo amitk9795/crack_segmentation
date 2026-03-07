@@ -433,15 +433,15 @@ def main():
                     st.info("The following definitions are based on **Tang et al. (2012)**.")
                     
                     st.markdown("""
-                    * **Surface Crack Ratio ($R_{sc}$):** Defined as the ratio of the crack area to the total surface area of the soil specimen.
-                    * **Number of Clods ($N_c$):** The clod is defined as the independent closed area that is split by cracks.
-                    * **Average Area of Clods ($A_{av}$):** The mean surface area of the identified soil clods.
-                    * **Number of Nodes ($N_n$):** The number of intersection nodes (where crack segments meet) or end nodes.
-                    * **Number of Crack Segments ($N_{seg}$):** The count of distinct crack segments defining the outline of the soil crack pattern.
-                    * **Average Length of Cracks ($L_{av}$):** The average trace length of the medial axis of crack segments.
-                    * **Crack Density ($D_c$):** Calculated as the total crack length per unit area.
-                    * **Average Width of Cracks ($W_{av}$):** Determined by calculating the shortest distance from a randomly chosen point on one boundary to the opposite boundary.
-                    * **Estimated Crack Volume ($V_{cr}$):** A derived volumetric estimation calculated as the Crack Area multiplied by the specimen thickness.
+                    * **Surface Crack Ratio (R_sc):** Defined as the ratio of the crack area to the total surface area of the soil specimen.
+                    * **Number of Clods (N_c):** The clod is defined as the independent closed area that is split by cracks.
+                    * **Average Area of Clods (A_av):** The mean surface area of the identified soil clods.
+                    * **Number of Nodes (N_n):** The number of intersection nodes (where crack segments meet) or end nodes.
+                    * **Number of Crack Segments (N_seg):** The count of distinct crack segments defining the outline of the soil crack pattern.
+                    * **Average Length of Cracks (L_av):** The average trace length of the medial axis of crack segments.
+                    * **Crack Density (D_c):** Calculated as the total crack length per unit area.
+                    * **Average Width of Cracks (W_av):** Determined by calculating the shortest distance from a randomly chosen point on one boundary to the opposite boundary.
+                    * **Estimated Crack Volume (V_cr):** A derived volumetric estimation calculated as the Crack Area multiplied by the specimen thickness.
                     """)
 
 if __name__ == "__main__":
