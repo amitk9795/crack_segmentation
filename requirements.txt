@@ -1,6 +1,5 @@
 streamlit
 opencv-python-headless
-numpy
 matplotlib
 ultralytics
 scikit-image
@@ -10,3 +9,4 @@ gdown
 dill
 pandas
 xlsxwriter
+numpy<2.0.0
