@@ -289,7 +289,7 @@ def main():
         # Analysis Mode Selection
         method = st.radio(
             "Select Analysis Method:",
-            ("AI Detection (YOLO)", "Manual Blue Fill"),
+            ("Manual Blue Fill", "AI Detection (YOLO)"),
             help="Choose 'AI Detection' for raw soil images. Choose 'Manual Blue Fill' if you have manually painted cracks with Blue (0,0,255)."
         )
         
