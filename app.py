@@ -2,13 +2,14 @@ import streamlit as st
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from ultralytics import YOLO
 from skimage.morphology import skeletonize, remove_small_objects, remove_small_holes
 from scipy import ndimage
-import os
-import gdown
 import pandas as pd
 import io
+import sys
+import subprocess
+import os
+import tempfile
 
 # =============================================================================
 # 1. PAGE CONFIGURATION & STYLING
@@ -48,24 +49,41 @@ st.markdown("""
 # Google Drive File ID for best.pt
 MODEL_ID = '1bQUE7ZL8luHRPWPX9P2u3zdtyAtWbQNP'
 MODEL_URL = f'https://drive.google.com/uc?id={MODEL_ID}'
-MODEL_FILENAME = 'best.pt'
+
+# Persistent local path so model is downloaded only once
+_MODEL_DIR = os.path.join(tempfile.gettempdir(), "crack_seg_model")
+_MODEL_PATH = os.path.join(_MODEL_DIR, "best.pt")
 
 @st.cache_resource
 def download_and_load_model():
     """
-    Downloads the YOLO model from Google Drive if not present, then loads it.
-    Uses st.cache_resource to ensure this only happens once.
+    Downloads the YOLO model from Google Drive to a local file,
+    then loads it from disk.  Uses st.cache_resource so this only
+    happens once per app session.
     """
-    if not os.path.exists(MODEL_FILENAME):
-        with st.spinner("Downloading Model from Drive... (This may take a moment)"):
-            try:
-                gdown.download(MODEL_URL, MODEL_FILENAME, quiet=False)
-            except Exception as e:
-                st.error(f"Failed to download model: {e}")
-                return None
-    
     try:
-        model = YOLO(MODEL_FILENAME)
+        # Ensure dill is available for model deserialization
+        try:
+            import dill  # noqa: F401
+        except ModuleNotFoundError:
+            with st.spinner("Installing missing dependency: dill"):
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "dill>=0.3.8"])
+
+        # --- Download the .pt file if it doesn't already exist ---
+        if not os.path.exists(_MODEL_PATH):
+            os.makedirs(_MODEL_DIR, exist_ok=True)
+            with st.spinner("Downloading model from Google Drive (one-time)..."):
+                try:
+                    import gdown
+                except ModuleNotFoundError:
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "gdown"])
+                    import gdown
+                gdown.download(MODEL_URL, _MODEL_PATH, quiet=False)
+
+        # --- Load from the local file ---
+        from ultralytics import YOLO
+        with st.spinner("Loading YOLO model..."):
+            model = YOLO(_MODEL_PATH)
         return model
     except Exception as e:
         st.error(f"Error loading YOLO model: {e}")
@@ -280,7 +298,7 @@ def main():
         if method == "AI Detection (YOLO)":
             model = download_and_load_model()
             if model:
-                st.success(f"✅ Model Loaded: {MODEL_FILENAME}")
+                st.success("✅ Model Loaded from Drive link")
             else:
                 st.error("❌ Model Failed to Load")
                 st.stop()

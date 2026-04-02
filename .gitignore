@@ -1,0 +1,5 @@
+# Local environments
+.venv/
+
+# Downloaded model artifact (fetched at runtime)
+best.pt

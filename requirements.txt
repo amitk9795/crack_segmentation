@@ -5,8 +5,8 @@ ultralytics
 scikit-image
 scipy
 pillow
+dill>=0.3.8
 gdown
-dill
 pandas
 xlsxwriter
 numpy<2.0.0
